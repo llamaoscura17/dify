@@ -1,7 +1,6 @@
 from collections.abc import Sequence
-from typing import cast
+from typing import Protocol, cast
 
-from core.model_manager import ModelInstance
 from dify_graph.file.models import File
 from dify_graph.model_runtime.entities import PromptMessageRole
 from dify_graph.model_runtime.entities.message_entities import (
@@ -18,13 +17,28 @@ from dify_graph.variables.segments import ArrayAnySegment, ArrayFileSegment, Fil
 from .exc import InvalidVariableTypeError
 
 
-def fetch_model_schema(*, model_instance: ModelInstance) -> AIModelEntity:
-    model_schema = cast(LargeLanguageModel, model_instance.model_type_instance).get_model_schema(
-        model_instance.model_name,
-        model_instance.credentials,
-    )
+class _GraphPreparedLLM(Protocol):
+    def get_model_schema(self) -> AIModelEntity: ...
+
+
+class _LegacyModelInstance(Protocol):
+    model_type_instance: object
+    model_name: str
+    credentials: object
+
+
+def fetch_model_schema(*, model_instance: object) -> AIModelEntity:
+    get_model_schema = getattr(model_instance, "get_model_schema", None)
+    if callable(get_model_schema):
+        model_schema = cast(_GraphPreparedLLM, model_instance).get_model_schema()
+    else:
+        legacy_model_instance = cast(_LegacyModelInstance, model_instance)
+        model_schema = cast(LargeLanguageModel, legacy_model_instance.model_type_instance).get_model_schema(
+            legacy_model_instance.model_name,
+            legacy_model_instance.credentials,
+        )
     if not model_schema:
-        raise ValueError(f"Model schema not found for {model_instance.model_name}")
+        raise ValueError(f"Model schema not found for {getattr(model_instance, 'model_name', 'unknown model')}")
     return model_schema
 
 

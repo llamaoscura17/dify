@@ -7,17 +7,8 @@ import logging
 import re
 import time
 from collections.abc import Generator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from sqlalchemy import select
-
-from core.helper.code_executor import CodeExecutor, CodeLanguage
-from core.llm_generator.output_parser.errors import OutputParserError
-from core.llm_generator.output_parser.structured_output import invoke_llm_with_structured_output
-from core.model_manager import ModelInstance
-from core.prompt.entities.advanced_prompt_entities import CompletionModelPromptTemplate, MemoryConfig
-from core.prompt.utils.prompt_message_util import PromptMessageUtil
-from core.tools.signature import sign_upload_file
 from dify_graph.constants import SYSTEM_VARIABLE_NODE_ID
 from dify_graph.entities import GraphInitParams
 from dify_graph.entities.graph_config import NodeConfigDict
@@ -28,7 +19,7 @@ from dify_graph.enums import (
     WorkflowNodeExecutionMetadataKey,
     WorkflowNodeExecutionStatus,
 )
-from dify_graph.file import File, FileTransferMethod, FileType, file_manager
+from dify_graph.file import File, FileType, file_manager
 from dify_graph.model_runtime.entities import (
     ImagePromptMessageContent,
     PromptMessage,
@@ -64,9 +55,15 @@ from dify_graph.node_events import (
 from dify_graph.nodes.base.entities import VariableSelector
 from dify_graph.nodes.base.node import Node
 from dify_graph.nodes.base.variable_template_parser import VariableTemplateParser
-from dify_graph.nodes.llm.protocols import CredentialsProvider, ModelFactory
+from dify_graph.nodes.llm.runtime_protocols import (
+    PreparedLLMProtocol,
+    PromptMessageSerializerProtocol,
+    RetrieverAttachmentLoaderProtocol,
+)
 from dify_graph.nodes.protocols import HttpClientProtocol
+from dify_graph.prompt_entities import CompletionModelPromptTemplate, MemoryConfig
 from dify_graph.runtime import VariablePool
+from dify_graph.template_rendering import Jinja2TemplateRenderer, TemplateRenderError
 from dify_graph.variables import (
     ArrayFileSegment,
     ArraySegment,
@@ -75,9 +72,6 @@ from dify_graph.variables import (
     ObjectSegment,
     StringSegment,
 )
-from extensions.ext_database import db
-from models.dataset import SegmentAttachmentBinding
-from models.model import UploadFile
 
 from . import llm_utils
 from .entities import (
@@ -94,7 +88,7 @@ from .exc import (
     TemplateTypeNotSupportError,
     VariableNotFoundError,
 )
-from .file_saver import FileSaverImpl, LLMFileSaver
+from .file_saver import LLMFileSaver
 
 if TYPE_CHECKING:
     from dify_graph.file.models import File
@@ -114,9 +108,10 @@ class LLMNode(Node[LLMNodeData]):
     _file_outputs: list[File]
 
     _llm_file_saver: LLMFileSaver
-    _credentials_provider: CredentialsProvider
-    _model_factory: ModelFactory
-    _model_instance: ModelInstance
+    _retriever_attachment_loader: RetrieverAttachmentLoaderProtocol | None
+    _prompt_message_serializer: PromptMessageSerializerProtocol
+    _jinja2_template_renderer: Jinja2TemplateRenderer | None
+    _model_instance: PreparedLLMProtocol
     _memory: PromptMessageMemory | None
 
     def __init__(
@@ -126,12 +121,15 @@ class LLMNode(Node[LLMNodeData]):
         graph_init_params: GraphInitParams,
         graph_runtime_state: GraphRuntimeState,
         *,
-        credentials_provider: CredentialsProvider,
-        model_factory: ModelFactory,
-        model_instance: ModelInstance,
+        credentials_provider: object | None = None,
+        model_factory: object | None = None,
+        model_instance: PreparedLLMProtocol,
         http_client: HttpClientProtocol,
         memory: PromptMessageMemory | None = None,
-        llm_file_saver: LLMFileSaver | None = None,
+        llm_file_saver: LLMFileSaver,
+        prompt_message_serializer: PromptMessageSerializerProtocol,
+        retriever_attachment_loader: RetrieverAttachmentLoaderProtocol | None = None,
+        jinja2_template_renderer: Jinja2TemplateRenderer | None = None,
     ):
         super().__init__(
             id=id,
@@ -142,19 +140,14 @@ class LLMNode(Node[LLMNodeData]):
         # LLM file outputs, used for MultiModal outputs.
         self._file_outputs = []
 
-        self._credentials_provider = credentials_provider
-        self._model_factory = model_factory
+        _ = credentials_provider, model_factory, http_client
         self._model_instance = model_instance
         self._memory = memory
 
-        if llm_file_saver is None:
-            dify_ctx = self.require_dify_context()
-            llm_file_saver = FileSaverImpl(
-                user_id=dify_ctx.user_id,
-                tenant_id=dify_ctx.tenant_id,
-                http_client=http_client,
-            )
         self._llm_file_saver = llm_file_saver
+        self._prompt_message_serializer = prompt_message_serializer
+        self._retriever_attachment_loader = retriever_attachment_loader
+        self._jinja2_template_renderer = jinja2_template_renderer
 
     @classmethod
     def version(cls) -> str:
@@ -240,6 +233,7 @@ class LLMNode(Node[LLMNodeData]):
                 variable_pool=variable_pool,
                 jinja2_variables=self.node_data.prompt_config.jinja2_variables,
                 context_files=context_files,
+                jinja2_template_renderer=self._jinja2_template_renderer,
             )
 
             # handle invoke result
@@ -247,7 +241,6 @@ class LLMNode(Node[LLMNodeData]):
                 model_instance=model_instance,
                 prompt_messages=prompt_messages,
                 stop=stop,
-                user_id=self.require_dify_context().user_id,
                 structured_output_enabled=self.node_data.structured_output_enabled,
                 structured_output=self.node_data.structured_output,
                 file_saver=self._llm_file_saver,
@@ -290,7 +283,7 @@ class LLMNode(Node[LLMNodeData]):
 
             process_data = {
                 "model_mode": self.node_data.model.mode,
-                "prompts": PromptMessageUtil.prompt_messages_to_prompt_for_saving(
+                "prompts": self._prompt_message_serializer.serialize(
                     model_mode=self.node_data.model.mode, prompt_messages=prompt_messages
                 ),
                 "usage": jsonable_encoder(usage),
@@ -358,10 +351,9 @@ class LLMNode(Node[LLMNodeData]):
     @staticmethod
     def invoke_llm(
         *,
-        model_instance: ModelInstance,
+        model_instance: PreparedLLMProtocol,
         prompt_messages: Sequence[PromptMessage],
         stop: Sequence[str] | None = None,
-        user_id: str,
         structured_output_enabled: bool,
         structured_output: Mapping[str, Any] | None = None,
         file_saver: LLMFileSaver,
@@ -372,35 +364,28 @@ class LLMNode(Node[LLMNodeData]):
     ) -> Generator[NodeEventBase | LLMStructuredOutput, None, None]:
         model_parameters = model_instance.parameters
         invoke_model_parameters = dict(model_parameters)
-
-        model_schema = llm_utils.fetch_model_schema(model_instance=model_instance)
-
         if structured_output_enabled:
             output_schema = LLMNode.fetch_structured_output_schema(
                 structured_output=structured_output or {},
             )
             request_start_time = time.perf_counter()
 
-            invoke_result = invoke_llm_with_structured_output(
-                provider=model_instance.provider,
-                model_schema=model_schema,
-                model_instance=model_instance,
+            invoke_result = model_instance.invoke_llm_with_structured_output(
                 prompt_messages=prompt_messages,
                 json_schema=output_schema,
                 model_parameters=invoke_model_parameters,
-                stop=list(stop or []),
+                stop=stop,
                 stream=True,
-                user=user_id,
             )
         else:
             request_start_time = time.perf_counter()
 
             invoke_result = model_instance.invoke_llm(
-                prompt_messages=list(prompt_messages),
+                prompt_messages=prompt_messages,
                 model_parameters=invoke_model_parameters,
-                stop=list(stop or []),
+                tools=None,
+                stop=stop,
                 stream=True,
-                user=user_id,
             )
 
         return LLMNode.handle_invoke_result(
@@ -409,6 +394,7 @@ class LLMNode(Node[LLMNodeData]):
             file_outputs=file_outputs,
             node_id=node_id,
             node_type=node_type,
+            model_instance=model_instance,
             reasoning_format=reasoning_format,
             request_start_time=request_start_time,
         )
@@ -421,6 +407,7 @@ class LLMNode(Node[LLMNodeData]):
         file_outputs: list[File],
         node_id: str,
         node_type: NodeType,
+        model_instance: PreparedLLMProtocol | object,
         reasoning_format: Literal["separated", "tagged"] = "tagged",
         request_start_time: float | None = None,
     ) -> Generator[NodeEventBase | LLMStructuredOutput, None, None]:
@@ -492,8 +479,14 @@ class LLMNode(Node[LLMNodeData]):
                         usage = result.delta.usage
                     if finish_reason is None and result.delta.finish_reason:
                         finish_reason = result.delta.finish_reason
-        except OutputParserError as e:
-            raise LLMNodeError(f"Failed to parse structured output: {e}")
+        except Exception as e:
+            if hasattr(model_instance, "is_structured_output_parse_error") and cast(
+                PreparedLLMProtocol, model_instance
+            ).is_structured_output_parse_error(e):
+                raise LLMNodeError(f"Failed to parse structured output: {e}") from e
+            if type(e).__name__ == "OutputParserError":
+                raise LLMNodeError(f"Failed to parse structured output: {e}") from e
+            raise
 
         # Extract reasoning content from <think> tags in the main text
         full_text = full_text_buffer.getvalue()
@@ -696,30 +689,8 @@ class LLMNode(Node[LLMNodeData]):
                             segment_id = retriever_resource.get("segment_id")
                             if not segment_id:
                                 continue
-                            attachments_with_bindings = db.session.execute(
-                                select(SegmentAttachmentBinding, UploadFile)
-                                .join(UploadFile, UploadFile.id == SegmentAttachmentBinding.attachment_id)
-                                .where(
-                                    SegmentAttachmentBinding.segment_id == segment_id,
-                                )
-                            ).all()
-                            if attachments_with_bindings:
-                                for _, upload_file in attachments_with_bindings:
-                                    attachment_info = File(
-                                        id=upload_file.id,
-                                        filename=upload_file.name,
-                                        extension="." + upload_file.extension,
-                                        mime_type=upload_file.mime_type,
-                                        tenant_id=self.require_dify_context().tenant_id,
-                                        type=FileType.IMAGE,
-                                        transfer_method=FileTransferMethod.LOCAL_FILE,
-                                        remote_url=upload_file.source_url,
-                                        related_id=upload_file.id,
-                                        size=upload_file.size,
-                                        storage_key=upload_file.key,
-                                        url=sign_upload_file(upload_file.id, upload_file.extension),
-                                    )
-                                    context_files.append(attachment_info)
+                            if self._retriever_attachment_loader is not None:
+                                context_files.extend(self._retriever_attachment_loader.load(segment_id=segment_id))
                 yield RunRetrieverResourceEvent(
                     retriever_resources=original_retriever_resource,
                     context=context_str.strip(),
@@ -764,7 +735,7 @@ class LLMNode(Node[LLMNodeData]):
         sys_files: Sequence[File],
         context: str | None = None,
         memory: PromptMessageMemory | None = None,
-        model_instance: ModelInstance,
+        model_instance: PreparedLLMProtocol,
         prompt_template: Sequence[LLMNodeChatModelMessage] | LLMNodeCompletionModelPromptTemplate,
         stop: Sequence[str] | None = None,
         memory_config: MemoryConfig | None = None,
@@ -773,6 +744,7 @@ class LLMNode(Node[LLMNodeData]):
         variable_pool: VariablePool,
         jinja2_variables: Sequence[VariableSelector],
         context_files: list[File] | None = None,
+        jinja2_template_renderer: Jinja2TemplateRenderer | None = None,
     ) -> tuple[Sequence[PromptMessage], Sequence[str] | None]:
         prompt_messages: list[PromptMessage] = []
         model_schema = llm_utils.fetch_model_schema(model_instance=model_instance)
@@ -786,6 +758,7 @@ class LLMNode(Node[LLMNodeData]):
                     jinja2_variables=jinja2_variables,
                     variable_pool=variable_pool,
                     vision_detail_config=vision_detail,
+                    jinja2_template_renderer=jinja2_template_renderer,
                 )
             )
 
@@ -812,6 +785,7 @@ class LLMNode(Node[LLMNodeData]):
                         jinja2_variables=[],
                         variable_pool=variable_pool,
                         vision_detail_config=vision_detail,
+                        jinja2_template_renderer=jinja2_template_renderer,
                     )
                 )
 
@@ -823,6 +797,7 @@ class LLMNode(Node[LLMNodeData]):
                     context=context,
                     jinja2_variables=jinja2_variables,
                     variable_pool=variable_pool,
+                    jinja2_template_renderer=jinja2_template_renderer,
                 )
             )
 
@@ -1048,6 +1023,7 @@ class LLMNode(Node[LLMNodeData]):
         jinja2_variables: Sequence[VariableSelector],
         variable_pool: VariablePool,
         vision_detail_config: ImagePromptMessageContent.DETAIL,
+        jinja2_template_renderer: Jinja2TemplateRenderer | None = None,
     ) -> Sequence[PromptMessage]:
         prompt_messages: list[PromptMessage] = []
         for message in messages:
@@ -1056,6 +1032,7 @@ class LLMNode(Node[LLMNodeData]):
                     template=message.jinja2_text or "",
                     jinja2_variables=jinja2_variables,
                     variable_pool=variable_pool,
+                    jinja2_template_renderer=jinja2_template_renderer,
                 )
                 prompt_message = _combine_message_content_with_role(
                     contents=[TextPromptMessageContent(data=result_text)], role=message.role
@@ -1237,7 +1214,7 @@ class LLMNode(Node[LLMNodeData]):
         return self.node_data.retry_config.retry_enabled
 
     @property
-    def model_instance(self) -> ModelInstance:
+    def model_instance(self) -> PreparedLLMProtocol:
         return self._model_instance
 
 
@@ -1260,6 +1237,7 @@ def _render_jinja2_message(
     template: str,
     jinja2_variables: Sequence[VariableSelector],
     variable_pool: VariablePool,
+    jinja2_template_renderer: Jinja2TemplateRenderer | None,
 ):
     if not template:
         return ""
@@ -1268,19 +1246,15 @@ def _render_jinja2_message(
     for jinja2_variable in jinja2_variables:
         variable = variable_pool.get(jinja2_variable.value_selector)
         jinja2_inputs[jinja2_variable.variable] = variable.to_object() if variable else ""
-    code_execute_resp = CodeExecutor.execute_workflow_code_template(
-        language=CodeLanguage.JINJA2,
-        code=template,
-        inputs=jinja2_inputs,
-    )
-    result_text = code_execute_resp["result"]
-    return result_text
+    if jinja2_template_renderer is None:
+        raise TemplateRenderError("LLMNode requires an injected jinja2_template_renderer for jinja2 prompts.")
+    return jinja2_template_renderer.render_template(template, jinja2_inputs)
 
 
 def _calculate_rest_token(
     *,
     prompt_messages: list[PromptMessage],
-    model_instance: ModelInstance,
+    model_instance: PreparedLLMProtocol,
 ) -> int:
     rest_tokens = 2000
     runtime_model_schema = llm_utils.fetch_model_schema(model_instance=model_instance)
@@ -1311,7 +1285,7 @@ def _handle_memory_chat_mode(
     *,
     memory: PromptMessageMemory | None,
     memory_config: MemoryConfig | None,
-    model_instance: ModelInstance,
+    model_instance: PreparedLLMProtocol,
 ) -> Sequence[PromptMessage]:
     memory_messages: Sequence[PromptMessage] = []
     # Get messages from memory for chat model
@@ -1331,7 +1305,7 @@ def _handle_memory_completion_mode(
     *,
     memory: PromptMessageMemory | None,
     memory_config: MemoryConfig | None,
-    model_instance: ModelInstance,
+    model_instance: PreparedLLMProtocol,
 ) -> str:
     memory_text = ""
     # Get history text from memory for completion model
@@ -1358,6 +1332,7 @@ def _handle_completion_template(
     context: str | None,
     jinja2_variables: Sequence[VariableSelector],
     variable_pool: VariablePool,
+    jinja2_template_renderer: Jinja2TemplateRenderer | None = None,
 ) -> Sequence[PromptMessage]:
     """Handle completion template processing outside of LLMNode class.
 
@@ -1376,6 +1351,7 @@ def _handle_completion_template(
             template=template.jinja2_text or "",
             jinja2_variables=jinja2_variables,
             variable_pool=variable_pool,
+            jinja2_template_renderer=jinja2_template_renderer,
         )
     else:
         if context:
