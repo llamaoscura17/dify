@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from dify_graph.file.models import File
 from dify_graph.model_runtime.entities import PromptMessageRole
@@ -35,7 +35,7 @@ def fetch_model_schema(*, model_instance: object) -> AIModelEntity:
         legacy_model_instance = cast(_LegacyModelInstance, model_instance)
         model_schema = cast(LargeLanguageModel, legacy_model_instance.model_type_instance).get_model_schema(
             legacy_model_instance.model_name,
-            legacy_model_instance.credentials,
+            cast(dict[str, Any] | None, legacy_model_instance.credentials),
         )
     if not model_schema:
         raise ValueError(f"Model schema not found for {getattr(model_instance, 'model_name', 'unknown model')}")
