@@ -28,6 +28,7 @@ class _LegacyModelInstance(Protocol):
 
 
 def fetch_model_schema(*, model_instance: object) -> AIModelEntity:
+    model_schema: AIModelEntity | None
     get_model_schema = getattr(model_instance, "get_model_schema", None)
     if callable(get_model_schema):
         model_schema = cast(_GraphPreparedLLM, model_instance).get_model_schema()
